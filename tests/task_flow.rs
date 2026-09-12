@@ -472,3 +472,81 @@ async fn due_filters_assignment_and_error_branches() {
     .await;
     missing_subtask.expect(StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn idempotent_members_empty_lists_and_validation() {
+    let app = spawn().await;
+    let owner = Uuid::now_v7();
+    let member = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+    let token = issue_token(&app, owner);
+    let member_token = issue_token(&app, member);
+    let stranger_token = issue_token(&app, stranger);
+
+    // 新用户项目列表为空
+    let empty = request(
+        &app.app,
+        "GET",
+        "/api/v1/task/projects",
+        Some(&stranger_token),
+        None,
+    )
+    .await;
+    assert_eq!(empty.expect(StatusCode::OK).as_array().unwrap().len(), 0);
+    // 无项目时我的任务为空
+    let my = request(
+        &app.app,
+        "GET",
+        "/api/v1/task/my/tasks",
+        Some(&stranger_token),
+        None,
+    )
+    .await;
+    assert_eq!(my.expect(StatusCode::OK).as_array().unwrap().len(), 0);
+
+    let project_id = create_project(&app, &token).await;
+    // 重复添加成员幂等
+    for _ in 0..2 {
+        request(
+            &app.app,
+            "POST",
+            &format!("/api/v1/task/projects/{project_id}/members"),
+            Some(&token),
+            Some(&json!({ "userIds": [member] })),
+        )
+        .await
+        .expect(StatusCode::OK);
+    }
+    // 成员可读取任务列表
+    let tasks = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/task/projects/{project_id}/tasks"),
+        Some(&member_token),
+        None,
+    )
+    .await;
+    tasks.expect(StatusCode::OK);
+
+    // 空列名 → 422
+    let bad_column = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/task/projects/{project_id}/columns"),
+        Some(&token),
+        Some(&json!({ "name": "  " })),
+    )
+    .await;
+    bad_column.expect(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 项目名称过长 → 422
+    let long_name = request(
+        &app.app,
+        "POST",
+        "/api/v1/task/projects",
+        Some(&token),
+        Some(&json!({ "name": "a".repeat(65) })),
+    )
+    .await;
+    long_name.expect(StatusCode::UNPROCESSABLE_ENTITY);
+}
