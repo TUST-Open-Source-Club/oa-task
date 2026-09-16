@@ -612,3 +612,66 @@ pub async fn delete_task(db: &DatabaseConnection, task_id: Uuid) -> Result<(), A
         .map_err(map_db_err)?;
     Ok(())
 }
+
+/// 按快照重建任务（撤销删除；负责人由调用方回填）。
+pub async fn restore_task(
+    db: &DatabaseConnection,
+    snapshot: &serde_json::Value,
+    fallback_created_by: Uuid,
+    now: DateTime<Utc>,
+) -> Result<task::Model, AppError> {
+    fn uuid_of(value: Option<&serde_json::Value>) -> Option<Uuid> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse().ok())
+    }
+    fn time_of(value: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    }
+    let missing = |field: &str| {
+        AppError::unprocessable(
+            "TASK_UNDO_UNSUPPORTED",
+            format!("快照缺少 {field}"),
+            vec![],
+        )
+    };
+    let model = task::ActiveModel {
+        id: Set(uuid_of(snapshot.get("id")).ok_or_else(|| missing("id"))?),
+        project_id: Set(uuid_of(snapshot.get("projectId")).ok_or_else(|| missing("projectId"))?),
+        column_id: Set(uuid_of(snapshot.get("columnId")).ok_or_else(|| missing("columnId"))?),
+        title: Set(snapshot
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("未命名任务")
+            .to_string()),
+        description_md: Set(snapshot
+            .get("descriptionMd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()),
+        assignee_id: Set(uuid_of(snapshot.get("assigneeId"))),
+        start_at: Set(time_of(snapshot.get("startAt"))),
+        priority: Set(snapshot
+            .get("priority")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("normal")
+            .to_string()),
+        due_at: Set(time_of(snapshot.get("dueAt"))),
+        position: Set(snapshot
+            .get("position")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)),
+        created_by: Set(fallback_created_by),
+        status: Set(snapshot
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active")
+            .to_string()),
+        completed_at: Set(time_of(snapshot.get("completedAt"))),
+        created_at: Set(now.fixed_offset()),
+        updated_at: Set(now.fixed_offset()),
+    };
+    model.insert(db).await.map_err(map_db_err)
+}

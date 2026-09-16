@@ -477,6 +477,7 @@ pub async fn update_task(
             ));
         }
     }
+    let before_snapshot = task_snapshot(&state, &model).await?;
     let old_assignees = repo::list_task_assignees(&state.db, model.id).await?;
     let legacy_old: Vec<Uuid> = if old_assignees.is_empty() {
         model.assignee_id.into_iter().collect()
@@ -539,6 +540,18 @@ pub async fn update_task(
     } else if matches!(input.assignee_id, Some(None)) {
         repo::set_task_assignees(&state.db, updated.id, &[], state.now()).await?;
     }
+    let after_snapshot = task_snapshot(&state, &updated).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "task",
+        &updated.id.to_string(),
+        "update",
+        Some(before_snapshot),
+        Some(after_snapshot),
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(Json(task_dto(&state, &updated).await?))
 }
 
@@ -566,7 +579,20 @@ pub async fn update_task_status(
         ));
     }
     let model = load_task_for_member(&state, user_id, task_id).await?;
+    let before_snapshot = task_snapshot(&state, &model).await?;
     let updated = repo::update_task_status(&state.db, &model, &input.status, state.now()).await?;
+    let after_snapshot = task_snapshot(&state, &updated).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "task",
+        &updated.id.to_string(),
+        "status",
+        Some(before_snapshot),
+        Some(after_snapshot),
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     if matches!(input.status.as_str(), "done" | "terminated") {
         let mut targets = repo::list_task_assignees(&state.db, updated.id).await?;
         if targets.is_empty() {
@@ -635,7 +661,19 @@ pub async fn delete_task(
 ) -> Result<StatusCode, AppError> {
     let user_id = user_id_of(&auth)?;
     let model = load_task_for_member(&state, user_id, task_id).await?;
+    let before_snapshot = task_snapshot(&state, &model).await?;
     repo::delete_task(&state.db, model.id).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "task",
+        &model.id.to_string(),
+        "delete",
+        Some(before_snapshot),
+        None,
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -897,6 +935,127 @@ pub async fn delete_project(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 任务快照（审计/撤销用）。
+async fn task_snapshot(state: &SharedState, model: &task::Model) -> Result<serde_json::Value, AppError> {
+    Ok(serde_json::to_value(task_dto(state, model).await?).map_err(AppError::internal)?)
+}
+
+/// 从快照解析可空时间（缺省 = None 不修改；null = 清空）。
+fn snapshot_dt(snapshot: &serde_json::Value, key: &str) -> Option<Option<DateTime<Utc>>> {
+    match snapshot.get(key) {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(text)) => Some(
+            DateTime::parse_from_rfc3339(text)
+                .ok()
+                .map(|value| value.with_timezone(&Utc)),
+        ),
+        _ => None,
+    }
+}
+
+/// 从快照解析负责人列表。
+fn snapshot_assignees(snapshot: &serde_json::Value) -> Vec<Uuid> {
+    snapshot
+        .get("assigneeIds")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|value| value.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `GET /tasks/{id}/changes`：任务操作记录。
+pub async fn list_task_changes(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<club_bus::audit::ChangeEntry>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_task_for_member(&state, user_id, task_id).await?;
+    let items = club_bus::audit::list_for(&state.db, "task", &task_id.to_string(), 50)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(items))
+}
+
+/// `POST /changes/{id}/undo`：撤销一次任务变更（删除类按快照重建）。
+pub async fn undo_change(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(change_id): Path<Uuid>,
+) -> Result<Json<TaskDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let entry = club_bus::audit::find(&state.db, change_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("TASK_CHANGE_NOT_FOUND", "变更记录不存在"))?;
+    if entry.entity != "task" {
+        return Err(AppError::unprocessable(
+            "TASK_UNDO_UNSUPPORTED",
+            "仅支持撤销任务变更",
+            vec![],
+        ));
+    }
+    let before = entry.before.clone().ok_or_else(|| {
+        AppError::unprocessable("TASK_UNDO_UNSUPPORTED", "该记录不可撤销", vec![])
+    })?;
+    let now = state.now();
+    let updated = if entry.action == "delete" {
+        let project_id: Uuid = before
+            .get("projectId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| AppError::unprocessable("TASK_UNDO_UNSUPPORTED", "快照缺少项目", vec![]))?;
+        repo::ensure_member(&state.db, project_id, user_id).await?;
+        let model = repo::restore_task(&state.db, &before, user_id, now).await?;
+        repo::set_task_assignees(&state.db, model.id, &snapshot_assignees(&before), now).await?;
+        model
+    } else {
+        let task_id: Uuid = entry.entity_id.parse().map_err(AppError::internal)?;
+        let model = load_task_for_member(&state, user_id, task_id).await?;
+        let assignees = snapshot_assignees(&before);
+        let updated = repo::update_task(
+            &state.db,
+            &model,
+            before.get("title").and_then(serde_json::Value::as_str).map(str::to_string),
+            before
+                .get("descriptionMd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            Some(assignees.first().copied()),
+            before.get("priority").and_then(serde_json::Value::as_str).map(str::to_string),
+            snapshot_dt(&before, "dueAt"),
+            snapshot_dt(&before, "startAt"),
+            now,
+        )
+        .await?;
+        repo::set_task_assignees(&state.db, updated.id, &assignees, now).await?;
+        let status = before
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        repo::update_task_status(&state.db, &updated, status, now).await?
+    };
+    let snapshot = task_snapshot(&state, &updated).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "task",
+        &updated.id.to_string(),
+        "undo",
+        Some(snapshot.clone()),
+        None,
+        Some(user_id),
+        now,
+    )
+    .await;
+    Ok(Json(task_dto(&state, &updated).await?))
+}
+
 /// 移动任务请求。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1139,6 +1298,8 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/tasks/{id}/status", post(update_task_status))
         .route("/tasks/{id}/claim", post(claim_task))
+        .route("/tasks/{id}/changes", get(list_task_changes))
+        .route("/changes/{id}/undo", post(undo_change))
         .route(
             "/tasks/{id}/attachments",
             get(list_attachments).post(upload_attachment).layer(
