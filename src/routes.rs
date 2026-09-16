@@ -5,15 +5,15 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
-use sea_orm::EntityTrait;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use club_auth_sdk::AuthUser;
-use club_common::{AppError, FieldError};
+use club_common::{new_id, AppError, FieldError};
 
-use crate::entity::{column, comment, subtask, task};
+use crate::entity::{column, comment, subtask, task, task_attachment};
 use crate::repo;
 use crate::state::SharedState;
 
@@ -639,6 +639,185 @@ pub async fn delete_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 附件 DTO。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDto {
+    /// ID。
+    pub id: String,
+    /// 文件名。
+    pub name: String,
+    /// 字节数。
+    pub size: i64,
+    /// MIME。
+    pub mime: String,
+    /// 上传者。
+    pub uploader_id: String,
+    /// 上传时间。
+    pub created_at: DateTime<FixedOffset>,
+}
+
+impl From<&task_attachment::Model> for AttachmentDto {
+    fn from(model: &task_attachment::Model) -> Self {
+        Self {
+            id: model.id.to_string(),
+            name: model.name.clone(),
+            size: model.size,
+            mime: model.mime.clone(),
+            uploader_id: model.uploader_id.to_string(),
+            created_at: model.created_at,
+        }
+    }
+}
+
+/// 附件上传查询参数。
+#[derive(Debug, Deserialize)]
+pub struct AttachmentUploadQuery {
+    /// 文件名。
+    pub name: String,
+    /// MIME（可选）。
+    pub mime: Option<String>,
+}
+
+/// 简易百分号编码（用于 Content-Disposition 的 UTF-8 文件名）。
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+/// `GET /tasks/{id}/attachments`。
+pub async fn list_attachments(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<Vec<AttachmentDto>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_task_for_member(&state, user_id, task_id).await?;
+    let rows = task_attachment::Entity::find()
+        .filter(task_attachment::Column::TaskId.eq(task_id))
+        .order_by_asc(task_attachment::Column::CreatedAt)
+        .all(&state.db)
+        .await
+        .map_err(repo::map_db_err)?;
+    Ok(Json(rows.iter().map(AttachmentDto::from).collect()))
+}
+
+/// `POST /tasks/{id}/attachments?name=&mime=`（原始字节体）。
+pub async fn upload_attachment(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+    Query(query): Query<AttachmentUploadQuery>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<AttachmentDto>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_task_for_member(&state, user_id, task_id).await?;
+    let name = query.name.trim();
+    if name.is_empty() || name.chars().count() > 255 {
+        return Err(AppError::unprocessable(
+            "TASK_VALIDATION",
+            "文件名需为 1 ~ 255 字符",
+            vec![FieldError::new("name", "非法")],
+        ));
+    }
+    if body.len() > 50 * 1024 * 1024 {
+        return Err(AppError::unprocessable(
+            "TASK_VALIDATION",
+            "附件不能超过 50MB",
+            vec![FieldError::new("file", "过大")],
+        ));
+    }
+    let attachment_id = new_id();
+    let storage_key = format!("{task_id}/{attachment_id}");
+    let dir = std::path::Path::new(&state.config.storage_path).join(task_id.to_string());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(AppError::internal)?;
+    tokio::fs::write(dir.join(attachment_id.to_string()), &body)
+        .await
+        .map_err(AppError::internal)?;
+    let mime = query
+        .mime
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let model = task_attachment::ActiveModel {
+        id: Set(attachment_id),
+        task_id: Set(task_id),
+        name: Set(name.to_string()),
+        size: Set(body.len() as i64),
+        mime: Set(mime),
+        storage_key: Set(storage_key),
+        uploader_id: Set(user_id),
+        created_at: Set(state.now().fixed_offset()),
+    }
+    .insert(&state.db)
+    .await
+    .map_err(repo::map_db_err)?;
+    Ok((StatusCode::CREATED, Json(AttachmentDto::from(&model))))
+}
+
+/// `GET /tasks/{id}/attachments/{attachment_id}/download`。
+pub async fn download_attachment(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((task_id, attachment_id)): Path<(Uuid, Uuid)>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let user_id = user_id_of(&auth)?;
+    load_task_for_member(&state, user_id, task_id).await?;
+    let model = task_attachment::Entity::find_by_id(attachment_id)
+        .filter(task_attachment::Column::TaskId.eq(task_id))
+        .one(&state.db)
+        .await
+        .map_err(repo::map_db_err)?
+        .ok_or_else(|| AppError::not_found("TASK_ATTACHMENT_NOT_FOUND", "附件不存在"))?;
+    let path = std::path::Path::new(&state.config.storage_path).join(&model.storage_key);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| AppError::not_found("TASK_ATTACHMENT_NOT_FOUND", "附件文件缺失"))?;
+    let disposition = format!("attachment; filename*=UTF-8''{}", percent_encode(&model.name));
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, model.mime.clone()),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `DELETE /tasks/{id}/attachments/{attachment_id}`。
+pub async fn delete_attachment(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((task_id, attachment_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_task_for_member(&state, user_id, task_id).await?;
+    let model = task_attachment::Entity::find_by_id(attachment_id)
+        .filter(task_attachment::Column::TaskId.eq(task_id))
+        .one(&state.db)
+        .await
+        .map_err(repo::map_db_err)?
+        .ok_or_else(|| AppError::not_found("TASK_ATTACHMENT_NOT_FOUND", "附件不存在"))?;
+    task_attachment::Entity::delete_by_id(attachment_id)
+        .exec(&state.db)
+        .await
+        .map_err(repo::map_db_err)?;
+    let path = std::path::Path::new(&state.config.storage_path).join(&model.storage_key);
+    let _ = tokio::fs::remove_file(path).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 移动任务请求。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -877,6 +1056,20 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/tasks/{id}/status", post(update_task_status))
         .route("/tasks/{id}/claim", post(claim_task))
+        .route(
+            "/tasks/{id}/attachments",
+            get(list_attachments).post(upload_attachment).layer(
+                axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024),
+            ),
+        )
+        .route(
+            "/tasks/{id}/attachments/{attachment_id}/download",
+            get(download_attachment),
+        )
+        .route(
+            "/tasks/{id}/attachments/{attachment_id}",
+            axum::routing::delete(delete_attachment),
+        )
         .route("/tasks/{id}/move", post(move_task))
         .route(
             "/tasks/{id}/subtasks",

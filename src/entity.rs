@@ -172,6 +172,40 @@ pub mod task_assignee {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 任务附件。
+pub mod task_attachment {
+    use sea_orm::entity::prelude::*;
+
+    /// 附件模型。
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "task_attachments")]
+    pub struct Model {
+        /// ID。
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        /// 任务。
+        pub task_id: Uuid,
+        /// 原始文件名。
+        pub name: String,
+        /// 字节数。
+        pub size: i64,
+        /// MIME。
+        pub mime: String,
+        /// 存储相对路径（{task_id}/{attachment_id}）。
+        pub storage_key: String,
+        /// 上传者。
+        pub uploader_id: Uuid,
+        /// 上传时间。
+        pub created_at: DateTimeWithTimeZone,
+    }
+
+    /// 关系。
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// 子任务。
 pub mod subtask {
     use sea_orm::entity::prelude::*;

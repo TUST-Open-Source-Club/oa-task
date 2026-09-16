@@ -22,6 +22,8 @@ pub mod config {
         pub issuer: String,
         /// Redis（可选，启用事件投递）。
         pub redis_url: Option<String>,
+        /// 附件存储目录。
+        pub storage_path: String,
     }
 
     impl Config {
@@ -48,6 +50,10 @@ pub mod config {
                     .trim_end_matches('/')
                     .to_string(),
                 redis_url: map.get("REDIS_URL").cloned(),
+                storage_path: map
+                    .get("TASK_STORAGE_PATH")
+                    .cloned()
+                    .unwrap_or_else(|| "/data/storage".to_string()),
             })
         }
     }
@@ -169,6 +175,7 @@ pub mod state {
 pub mod entity;
 pub mod migration;
 pub mod migration2;
+pub mod migration3;
 pub mod repo;
 /// HTTP 路由。
 pub mod routes;

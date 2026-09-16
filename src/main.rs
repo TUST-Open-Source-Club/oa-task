@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     Migrator::up(&database, None)
         .await
         .context("数据库迁移失败")?;
+    std::fs::create_dir_all(&config.storage_path).context("创建附件存储目录失败")?;
 
     let bus = match &config.redis_url {
         Some(url) => Some(
