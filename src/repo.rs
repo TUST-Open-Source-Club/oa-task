@@ -235,6 +235,89 @@ pub async fn create_task(
     .map_err(map_db_err)
 }
 
+/// 更新项目名称/描述（None 表示不修改）。
+pub async fn update_project(
+    db: &DatabaseConnection,
+    project: &project::Model,
+    name: Option<String>,
+    description: Option<String>,
+) -> Result<project::Model, AppError> {
+    let mut active: project::ActiveModel = project.clone().into();
+    if let Some(name) = name {
+        active.name = Set(name);
+    }
+    if let Some(description) = description {
+        active.description = Set(description);
+    }
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 删除项目：级联任务（负责人/附件/子任务/评论）、看板列与成员。
+pub async fn delete_project(db: &DatabaseConnection, project_id: Uuid) -> Result<(), AppError> {
+    use crate::entity::{comment, subtask, task_assignee, task_attachment};
+    let task_ids: Vec<Uuid> = task::Entity::find()
+        .filter(task::Column::ProjectId.eq(project_id))
+        .all(db)
+        .await
+        .map_err(map_db_err)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if !task_ids.is_empty() {
+        task_assignee::Entity::delete_many()
+            .filter(task_assignee::Column::TaskId.is_in(task_ids.clone()))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+        task_attachment::Entity::delete_many()
+            .filter(task_attachment::Column::TaskId.is_in(task_ids.clone()))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+        subtask::Entity::delete_many()
+            .filter(subtask::Column::TaskId.is_in(task_ids.clone()))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+        comment::Entity::delete_many()
+            .filter(comment::Column::TaskId.is_in(task_ids))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+        task::Entity::delete_many()
+            .filter(task::Column::ProjectId.eq(project_id))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+    }
+    column::Entity::delete_many()
+        .filter(column::Column::ProjectId.eq(project_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    project_member::Entity::delete_many()
+        .filter(project_member::Column::ProjectId.eq(project_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    project::Entity::delete_by_id(project_id)
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(())
+}
+
+/// 按 ID 查询项目。
+pub async fn find_project(
+    db: &DatabaseConnection,
+    project_id: Uuid,
+) -> Result<Option<project::Model>, AppError> {
+    project::Entity::find_by_id(project_id)
+        .one(db)
+        .await
+        .map_err(map_db_err)
+}
+
 /// 查找任务。
 pub async fn find_task(
     db: &DatabaseConnection,

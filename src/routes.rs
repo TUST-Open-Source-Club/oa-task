@@ -13,7 +13,7 @@ use uuid::Uuid;
 use club_auth_sdk::AuthUser;
 use club_common::{new_id, AppError, FieldError};
 
-use crate::entity::{column, comment, subtask, task, task_attachment};
+use crate::entity::{column, comment, project, subtask, task, task_attachment};
 use crate::repo;
 use crate::state::SharedState;
 
@@ -818,6 +818,85 @@ pub async fn delete_attachment(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 更新项目请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProjectRequest {
+    /// 名称。
+    pub name: Option<String>,
+    /// 描述。
+    pub description: Option<String>,
+}
+
+/// 校验项目管理员（项目成员中的 admin 或创建者）。
+async fn ensure_project_admin(
+    state: &SharedState,
+    project: &project::Model,
+    user_id: Uuid,
+) -> Result<(), AppError> {
+    if project.owner_id == user_id {
+        return Ok(());
+    }
+    let member = repo::ensure_member(&state.db, project.id, user_id).await?;
+    if member.role == "admin" {
+        Ok(())
+    } else {
+        Err(AppError::forbidden(
+            "TASK_FORBIDDEN",
+            "仅项目管理员可执行该操作",
+        ))
+    }
+}
+
+/// `PATCH /projects/{id}`：编辑项目。
+pub async fn update_project(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<UpdateProjectRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let project = repo::find_project(&state.db, project_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("TASK_PROJECT_NOT_FOUND", "项目不存在"))?;
+    ensure_project_admin(&state, &project, user_id).await?;
+    if let Some(name) = input.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(AppError::unprocessable(
+                "TASK_VALIDATION",
+                "项目名称需为 1 ~ 64 字符",
+                vec![FieldError::new("name", "非法")],
+            ));
+        }
+    }
+    let updated = repo::update_project(
+        &state.db,
+        &project,
+        input.name.map(|name| name.trim().to_string()),
+        input.description,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "id": updated.id, "name": updated.name, "description": updated.description }),
+    ))
+}
+
+/// `DELETE /projects/{id}`：删除项目及其全部任务。
+pub async fn delete_project(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(project_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let project = repo::find_project(&state.db, project_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("TASK_PROJECT_NOT_FOUND", "项目不存在"))?;
+    ensure_project_admin(&state, &project, user_id).await?;
+    repo::delete_project(&state.db, project_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 移动任务请求。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1045,6 +1124,10 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}/members", post(add_members))
+        .route(
+            "/projects/{id}",
+            axum::routing::patch(update_project).delete(delete_project),
+        )
         .route(
             "/projects/{id}/columns",
             get(list_columns).post(create_column),
