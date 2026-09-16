@@ -9,7 +9,9 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 10001 app
+    && useradd -m -u 10001 app \
+    && mkdir -p /data/storage \
+    && chown -R app:app /data
 COPY --from=builder /src/target/release/task-service /usr/local/bin/task-service
 USER app
 EXPOSE 8083
