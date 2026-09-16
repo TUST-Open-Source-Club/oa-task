@@ -110,8 +110,14 @@ pub struct TaskDto {
     pub title: String,
     /// 描述。
     pub description_md: String,
-    /// 负责人。
+    /// 负责人（多负责人中的首个，兼容字段）。
     pub assignee_id: Option<String>,
+    /// 负责人列表。
+    pub assignee_ids: Vec<String>,
+    /// 开始时间。
+    pub start_at: Option<DateTime<FixedOffset>>,
+    /// 状态：active/done/terminated。
+    pub status: String,
     /// 优先级。
     pub priority: String,
     /// 截止时间。
@@ -133,6 +139,9 @@ impl From<&task::Model> for TaskDto {
             title: model.title.clone(),
             description_md: model.description_md.clone(),
             assignee_id: model.assignee_id.map(|id| id.to_string()),
+            assignee_ids: model.assignee_id.map(|id| id.to_string()).into_iter().collect(),
+            start_at: model.start_at,
+            status: model.status.clone(),
             priority: model.priority.clone(),
             due_at: model.due_at,
             position: model.position,
@@ -285,7 +294,22 @@ pub async fn list_tasks(
     let user_id = user_id_of(&auth)?;
     repo::ensure_member(&state.db, project_id, user_id).await?;
     let tasks = repo::list_tasks(&state.db, project_id, query.column_id, query.assignee_id).await?;
-    Ok(Json(tasks.iter().map(TaskDto::from).collect()))
+    let mut items = Vec::with_capacity(tasks.len());
+    for model in &tasks {
+        items.push(task_dto(&state, model).await?);
+    }
+    Ok(Json(items))
+}
+
+/// 加载负责人列表并构造 DTO。
+async fn task_dto(state: &SharedState, model: &task::Model) -> Result<TaskDto, AppError> {
+    let mut dto = TaskDto::from(model);
+    let assignees = repo::list_task_assignees(&state.db, model.id).await?;
+    if !assignees.is_empty() {
+        dto.assignee_ids = assignees.iter().map(|id| id.to_string()).collect();
+        dto.assignee_id = assignees.first().map(|id| id.to_string());
+    }
+    Ok(dto)
 }
 
 /// 创建任务请求。
@@ -298,12 +322,16 @@ pub struct CreateTaskRequest {
     pub title: String,
     /// 描述。
     pub description_md: Option<String>,
-    /// 负责人。
+    /// 负责人（单人选，兼容）。
     pub assignee_id: Option<Uuid>,
+    /// 负责人列表（多人）。
+    pub assignee_ids: Option<Vec<Uuid>>,
     /// 优先级。
     pub priority: Option<String>,
     /// 截止时间（RFC3339）。
     pub due_at: Option<DateTime<Utc>>,
+    /// 开始时间（RFC3339）。
+    pub start_at: Option<DateTime<Utc>>,
 }
 
 /// `POST /projects/{id}/tasks`。
@@ -335,26 +363,35 @@ pub async fn create_task(
             vec![FieldError::new("priority", "仅支持 low/normal/high/urgent")],
         ));
     }
+    let mut assignees = input.assignee_ids.unwrap_or_default();
+    if assignees.is_empty() {
+        assignees.extend(input.assignee_id);
+    }
+    assignees.dedup();
     let model = repo::create_task(
         &state.db,
         project_id,
         column.id,
         title,
         input.description_md.as_deref().unwrap_or(""),
-        input.assignee_id,
+        assignees.first().copied(),
         &priority,
         input.due_at,
+        input.start_at,
         user_id,
         state.now(),
     )
     .await?;
-    if let Some(assignee) = model.assignee_id {
-        if assignee != user_id {
+    if !assignees.is_empty() {
+        repo::set_task_assignees(&state.db, model.id, &assignees, state.now()).await?;
+    }
+    for assignee in &assignees {
+        if *assignee != user_id {
             enqueue_event(
                 &state,
                 "task.assigned",
                 user_id,
-                vec![assignee],
+                vec![*assignee],
                 model.id,
                 "有新任务指派给你",
                 &model.title,
@@ -363,7 +400,7 @@ pub async fn create_task(
             .await;
         }
     }
-    Ok((StatusCode::CREATED, Json(TaskDto::from(&model))))
+    Ok((StatusCode::CREATED, Json(task_dto(&state, &model).await?)))
 }
 
 /// 加载任务并校验项目成员。
@@ -410,11 +447,16 @@ pub struct UpdateTaskRequest {
     /// 负责人（null 表示清空）。
     #[serde(default, deserialize_with = "double_option")]
     pub assignee_id: Option<Option<Uuid>>,
+    /// 负责人列表（覆盖式；空数组表示清空）。
+    pub assignee_ids: Option<Vec<Uuid>>,
     /// 优先级。
     pub priority: Option<String>,
     /// 截止时间（null 表示清空）。
     #[serde(default, deserialize_with = "double_option")]
     pub due_at: Option<Option<DateTime<Utc>>>,
+    /// 开始时间（null 表示清空）。
+    #[serde(default, deserialize_with = "double_option")]
+    pub start_at: Option<Option<DateTime<Utc>>>,
 }
 
 /// `PATCH /tasks/{id}`。
@@ -435,26 +477,42 @@ pub async fn update_task(
             ));
         }
     }
-    let old_assignee = model.assignee_id;
+    let old_assignees = repo::list_task_assignees(&state.db, model.id).await?;
+    let legacy_old: Vec<Uuid> = if old_assignees.is_empty() {
+        model.assignee_id.into_iter().collect()
+    } else {
+        old_assignees
+    };
+    let mut replaced: Option<Vec<Uuid>> = None;
+    let assignee_field = if let Some(mut list) = input.assignee_ids {
+        list.dedup();
+        let first = list.first().copied();
+        replaced = Some(list);
+        Some(first)
+    } else {
+        input.assignee_id
+    };
     let updated = repo::update_task(
         &state.db,
         &model,
         input.title,
         input.description_md,
-        input.assignee_id,
+        assignee_field,
         input.priority,
         input.due_at,
+        input.start_at,
         state.now(),
     )
     .await?;
-    if updated.assignee_id != old_assignee {
-        if let Some(assignee) = updated.assignee_id {
-            if assignee != user_id {
+    if let Some(list) = replaced {
+        repo::set_task_assignees(&state.db, updated.id, &list, state.now()).await?;
+        for assignee in &list {
+            if *assignee != user_id && !legacy_old.contains(assignee) {
                 enqueue_event(
                     &state,
                     "task.assigned",
                     user_id,
-                    vec![assignee],
+                    vec![*assignee],
                     updated.id,
                     "有新任务指派给你",
                     &updated.title,
@@ -463,8 +521,122 @@ pub async fn update_task(
                 .await;
             }
         }
+    } else if let Some(Some(assignee)) = input.assignee_id {
+        repo::set_task_assignees(&state.db, updated.id, &[assignee], state.now()).await?;
+        if assignee != user_id && !legacy_old.contains(&assignee) {
+            enqueue_event(
+                &state,
+                "task.assigned",
+                user_id,
+                vec![assignee],
+                updated.id,
+                "有新任务指派给你",
+                &updated.title,
+                "high",
+            )
+            .await;
+        }
+    } else if matches!(input.assignee_id, Some(None)) {
+        repo::set_task_assignees(&state.db, updated.id, &[], state.now()).await?;
     }
-    Ok(Json(TaskDto::from(&updated)))
+    Ok(Json(task_dto(&state, &updated).await?))
+}
+
+/// 更新任务状态请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskStatusRequest {
+    /// active / done / terminated。
+    pub status: String,
+}
+
+/// `POST /tasks/{id}/status`。
+pub async fn update_task_status(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+    Json(input): Json<UpdateTaskStatusRequest>,
+) -> Result<Json<TaskDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    if !["active", "done", "terminated"].contains(&input.status.as_str()) {
+        return Err(AppError::unprocessable(
+            "TASK_VALIDATION",
+            "状态不合法",
+            vec![FieldError::new("status", "仅支持 active/done/terminated")],
+        ));
+    }
+    let model = load_task_for_member(&state, user_id, task_id).await?;
+    let updated = repo::update_task_status(&state.db, &model, &input.status, state.now()).await?;
+    if matches!(input.status.as_str(), "done" | "terminated") {
+        let mut targets = repo::list_task_assignees(&state.db, updated.id).await?;
+        if targets.is_empty() {
+            targets.extend(updated.assignee_id);
+        }
+        targets.retain(|id| *id != user_id);
+        if !targets.is_empty() {
+            let event_type = if input.status == "done" {
+                "task.completed"
+            } else {
+                "task.terminated"
+            };
+            enqueue_event(
+                &state,
+                event_type,
+                user_id,
+                targets,
+                updated.id,
+                "任务状态更新",
+                &updated.title,
+                "normal",
+            )
+            .await;
+        }
+    }
+    Ok(Json(task_dto(&state, &updated).await?))
+}
+
+/// `POST /tasks/{id}/claim`：认领任务（把自己加入负责人）。
+pub async fn claim_task(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<TaskDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model = load_task_for_member(&state, user_id, task_id).await?;
+    let mut assignees = repo::list_task_assignees(&state.db, model.id).await?;
+    if assignees.is_empty() {
+        assignees.extend(model.assignee_id);
+    }
+    if !assignees.contains(&user_id) {
+        assignees.push(user_id);
+    }
+    repo::set_task_assignees(&state.db, model.id, &assignees, state.now()).await?;
+    let first = assignees.first().copied();
+    let updated = repo::update_task(
+        &state.db,
+        &model,
+        None,
+        None,
+        Some(first),
+        None,
+        None,
+        None,
+        state.now(),
+    )
+    .await?;
+    Ok(Json(task_dto(&state, &updated).await?))
+}
+
+/// `DELETE /tasks/{id}`。
+pub async fn delete_task(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(task_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model = load_task_for_member(&state, user_id, task_id).await?;
+    repo::delete_task(&state.db, model.id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 移动任务请求。
@@ -682,7 +854,11 @@ pub async fn my_tasks(
         _ => (None, true),
     };
     let items = repo::my_tasks(&state.db, user_id, due_before, only_open).await?;
-    Ok(Json(items.iter().map(TaskDto::from).collect()))
+    let mut dtos = Vec::with_capacity(items.len());
+    for model in &items {
+        dtos.push(task_dto(&state, model).await?);
+    }
+    Ok(Json(dtos))
 }
 
 /// `/api/v1/task` 路由。
@@ -695,7 +871,12 @@ pub fn router() -> Router<SharedState> {
             get(list_columns).post(create_column),
         )
         .route("/projects/{id}/tasks", get(list_tasks).post(create_task))
-        .route("/tasks/{id}", get(get_task).patch(update_task))
+        .route(
+            "/tasks/{id}",
+            get(get_task).patch(update_task).delete(delete_task),
+        )
+        .route("/tasks/{id}/status", post(update_task_status))
+        .route("/tasks/{id}/claim", post(claim_task))
         .route("/tasks/{id}/move", post(move_task))
         .route(
             "/tasks/{id}/subtasks",

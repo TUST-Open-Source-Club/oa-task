@@ -114,9 +114,12 @@ pub mod task {
         /// 描述（Markdown）。
         #[sea_orm(column_type = "Text")]
         pub description_md: String,
-        /// 负责人。
+        /// 负责人（多负责人取首个，保持兼容）。
         #[sea_orm(nullable)]
         pub assignee_id: Option<Uuid>,
+        /// 开始时间。
+        #[sea_orm(nullable)]
+        pub start_at: Option<DateTimeWithTimeZone>,
         /// 优先级：low/normal/high/urgent。
         pub priority: String,
         /// 截止时间。
@@ -126,6 +129,8 @@ pub mod task {
         pub position: i64,
         /// 创建者。
         pub created_by: Uuid,
+        /// 状态：active/done/terminated。
+        pub status: String,
         /// 完成时间。
         #[sea_orm(nullable)]
         pub completed_at: Option<DateTimeWithTimeZone>,
@@ -133,6 +138,31 @@ pub mod task {
         pub created_at: DateTimeWithTimeZone,
         /// 更新时间。
         pub updated_at: DateTimeWithTimeZone,
+    }
+
+    /// 关系。
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// 任务负责人（多对多）。
+pub mod task_assignee {
+    use sea_orm::entity::prelude::*;
+
+    /// 负责人模型。
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "task_assignees")]
+    pub struct Model {
+        /// 任务。
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub task_id: Uuid,
+        /// 用户。
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub user_id: Uuid,
+        /// 指派时间。
+        pub assigned_at: DateTimeWithTimeZone,
     }
 
     /// 关系。

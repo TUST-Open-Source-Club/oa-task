@@ -202,6 +202,7 @@ pub async fn create_task(
     assignee_id: Option<Uuid>,
     priority: &str,
     due_at: Option<DateTime<Utc>>,
+    start_at: Option<DateTime<Utc>>,
     user_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<task::Model, AppError> {
@@ -219,10 +220,12 @@ pub async fn create_task(
         title: Set(title.to_string()),
         description_md: Set(description_md.to_string()),
         assignee_id: Set(assignee_id),
+        start_at: Set(start_at.map(|value| value.fixed_offset())),
         priority: Set(priority.to_string()),
         due_at: Set(due_at.map(|value| value.fixed_offset())),
         position: Set(max.unwrap_or(0) + 1),
         created_by: Set(user_id),
+        status: Set("active".to_string()),
         completed_at: Set(None),
         created_at: Set(now.fixed_offset()),
         updated_at: Set(now.fixed_offset()),
@@ -275,6 +278,7 @@ pub async fn update_task(
     assignee_id: Option<Option<Uuid>>,
     priority: Option<String>,
     due_at: Option<Option<DateTime<Utc>>>,
+    start_at: Option<Option<DateTime<Utc>>>,
     now: DateTime<Utc>,
 ) -> Result<task::Model, AppError> {
     let mut active: task::ActiveModel = task.clone().into();
@@ -292,6 +296,9 @@ pub async fn update_task(
     }
     if let Some(due_at) = due_at {
         active.due_at = Set(due_at.map(|value| value.fixed_offset()));
+    }
+    if let Some(start_at) = start_at {
+        active.start_at = Set(start_at.map(|value| value.fixed_offset()));
     }
     active.updated_at = Set(now.fixed_offset());
     active.update(db).await.map_err(map_db_err)
@@ -438,4 +445,87 @@ pub async fn list_comments(
         .all(db)
         .await
         .map_err(map_db_err)
+}
+
+/// 覆盖任务负责人（先清空再写入）。
+pub async fn set_task_assignees(
+    db: &DatabaseConnection,
+    task_id: Uuid,
+    user_ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    use crate::entity::task_assignee;
+    task_assignee::Entity::delete_many()
+        .filter(task_assignee::Column::TaskId.eq(task_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    for user_id in user_ids {
+        task_assignee::ActiveModel {
+            task_id: Set(task_id),
+            user_id: Set(*user_id),
+            assigned_at: Set(now.fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .map_err(map_db_err)?;
+    }
+    Ok(())
+}
+
+/// 任务负责人列表。
+pub async fn list_task_assignees(
+    db: &DatabaseConnection,
+    task_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    use crate::entity::task_assignee;
+    let rows = task_assignee::Entity::find()
+        .filter(task_assignee::Column::TaskId.eq(task_id))
+        .all(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(rows.into_iter().map(|row| row.user_id).collect())
+}
+
+/// 更新任务状态（done 记录完成时间，active 清除）。
+pub async fn update_task_status(
+    db: &DatabaseConnection,
+    task: &task::Model,
+    status: &str,
+    now: DateTime<Utc>,
+) -> Result<task::Model, AppError> {
+    let mut active: task::ActiveModel = task.clone().into();
+    active.status = Set(status.to_string());
+    active.completed_at = Set(if status == "done" {
+        Some(now.fixed_offset())
+    } else {
+        None
+    });
+    active.updated_at = Set(now.fixed_offset());
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 删除任务及其关联数据。
+pub async fn delete_task(db: &DatabaseConnection, task_id: Uuid) -> Result<(), AppError> {
+    use crate::entity::{comment, subtask, task_assignee};
+    task_assignee::Entity::delete_many()
+        .filter(task_assignee::Column::TaskId.eq(task_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    subtask::Entity::delete_many()
+        .filter(subtask::Column::TaskId.eq(task_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    comment::Entity::delete_many()
+        .filter(comment::Column::TaskId.eq(task_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    task::Entity::delete_by_id(task_id)
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(())
 }
